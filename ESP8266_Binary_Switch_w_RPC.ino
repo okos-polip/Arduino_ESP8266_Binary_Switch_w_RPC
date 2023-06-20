@@ -64,10 +64,21 @@
 #define setSwitchState(state) (digitalWrite(SWITCH_PIN, !(bool)(state))) //Active LOW
 
 //==============================================================================
+//  Data Structure Declaration
+//==============================================================================
+
+typedef struct _soft_timer {
+    bool active = false;
+    String timestamp;
+    int hours;
+    unsigned long _targetTime; // use getEpochTime()
+} soft_timer_t;
+
+//==============================================================================
 //  Declared Constants
 //==============================================================================
 
-const char* SERIAL_STR = "binary-switch-0-0000";
+const char* SERIAL_STR = "binary-switch-1-0000";
 const char* KEY_STR = "revocable-key-0";    //NOTE: Should be configurable
 const char* HARDWARE_STR = POLIP_VERSION_STD_FORMAT(0,0,1);
 const char* FIRMWARE_STR = POLIP_VERSION_STD_FORMAT(0,0,1);
@@ -82,14 +93,13 @@ static NTPClient _timeClient(_ntpUDP, NTP_URL, 0);
 static WiFiManager _wifiManager;
 static polip_device_t _polipDevice;
 static polip_workflow_t _polipWorkflow;
+static polip_rpc_workflow_t _polipRPCWorkflow;
 
 static unsigned long _resetTime;
 static bool _flag_reset = false;
 static bool _prevBtnState = false;
-static char _rxBuffer[50];
-static int _rxBufferIdx = 0;
 static bool _currentState = false;
-static unsigned long _pollTime;
+static soft_timer_t _timer;
 
 //==============================================================================
 //  Private Function Prototypes
@@ -98,6 +108,12 @@ static unsigned long _pollTime;
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc);
 static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source);
+static void _debugSerialInterface(void);
+static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parameters);
+static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc);
+static void _pushRPCSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc);
+static void _freeRPC(polip_device_t* dev, polip_rpc_t* rpc);
+static void _notificationSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc);
 
 //==============================================================================
 //  MAIN
@@ -124,16 +140,26 @@ void setup() {
     _polipDevice.firmwareStr = FIRMWARE_STR;
     _polipDevice.skipTagCheck = false;
 
+    _polipRPCWorkflow.params.pushAdditionalNotification = true;
+    _polipRPCWorkflow.hooks.acceptRPC = _acceptRPC;
+    _polipRPCWorkflow.hooks.cancelRPC = _cancelRPC;
+    _polipRPCWorkflow.hooks.freeRPC = _freeRPC;
+    _polipRPCWorkflow.hooks.pushRPCSetup = _pushRPCSetup;
+    _polipRPCWorkflow.hooks.pushNotifactionSetup = _notificationSetup;
+
     _polipWorkflow.device = &_polipDevice;
+    _polipWorkflow.rpcWorkflow = &_polipRPCWorkflow;
     _polipWorkflow.hooks.pushStateSetupCb = _pushStateSetup;
     _polipWorkflow.hooks.pollStateRespCb = _pollStateResponse;
     _polipWorkflow.hooks.workflowErrorCb = _errorHandler;
 
     unsigned long currentTime = millis();
     polip_workflow_initialize(&_polipWorkflow, currentTime);
-    _pollTime = _resetTime = currentTime;
+    _resetTime = currentTime;
     _flag_reset = false;
     _prevBtnState = false;
+
+    Serial.println("---");
 }
 
 void loop() {
@@ -143,10 +169,85 @@ void loop() {
     // Refresh time
     _timeClient.update();
 
+    // Monitor soft timer
+    if (_timer.active && _timeClient.getEpochTime() >= _timer._targetTime) {
+        _timer.active = false;
+        _currentState = false;
+        POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow);
+        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+    }
+
     // Update Polip Server
     polip_workflow_periodic_update(&_polipWorkflow, _doc, _timeClient.getFormattedTime().c_str(), currentTime);
 
     // Serial debugging interface provides full state control
+    _debugSerialInterface();
+    
+    // Handle Reset button
+    bool btnState = readResetBtnState();
+    if (!btnState && _prevBtnState) {
+        _resetTime = currentTime;
+    } else if (btnState && !_prevBtnState) {
+        if ((currentTime - _resetTime) >= RESET_BTN_TIME_THRESHOLD) {
+            Serial.println(F("Reset Button Held"));
+            _flag_reset = true;
+        }
+        // Otherwise button press was debounced.
+    }
+    _prevBtnState = btnState;
+
+     // Reset State Machine
+    if (_flag_reset) {
+        _flag_reset = false;
+        Serial.println(F("Erasing Config, restarting"));
+        _wifiManager.resetSettings();
+        ESP.restart();
+    }
+
+    // Update physical state
+    setSwitchState(_currentState);
+    delay(1);
+}
+
+//==============================================================================
+//  Private Function Implementation
+//==============================================================================
+
+static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
+    Serial.println(F("--\tPUSH STATE SETUP HOOK"));
+
+    JsonObject stateObj = doc.createNestedObject("state");
+    stateObj["power"] = _currentState;
+
+    if (_timer.active) {
+        JsonObject timer = stateObj.createNestedObject("timer");
+        timer["timestamp"] = _timer.timestamp;
+        timer["duration"] = _timer.hours;
+    } else {
+        stateObj["timer"] = nullptr;
+    }
+}
+
+static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
+    Serial.println(F("--\tPOLL STATE RESPONSE HOOK"));
+
+    JsonObject stateObj = doc["state"];
+    _currentState = stateObj["power"];
+
+    // Note ignore timer (must be set via RPC)
+}
+
+static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source) {
+    Serial.print(F("Error Handler ~ polip server error during OP="));
+    Serial.print((int)source);
+    Serial.print(F(" with CODE="));
+    Serial.println((int)_polipWorkflow.flags.error);
+} 
+
+static void _debugSerialInterface(void) {
+    static char _rxBuffer[50];
+    static int _rxBufferIdx = 0;
+
     while (Serial.available() > 0) {
         if (_rxBufferIdx >= (sizeof(_rxBuffer) - 1)) {
             Serial.println(F("Error - Buffer Overflow ~ Clearing"));
@@ -180,6 +281,18 @@ void loop() {
                     Serial.println(F("No Error"));
                 }
                 POLIP_WORKFLOW_ACK_ERROR(&_polipWorkflow);
+            } else if (str == "timer?") {
+                Serial.print(F("TIMER active = "));
+                Serial.println(_timer.active);
+
+                if (_timer.active) {
+                    Serial.print(F("Timestamp = "));
+                    Serial.println(_timer.timestamp);
+                    Serial.print(F("Hours = "));
+                    Serial.println(_timer.hours);
+                    Serial.print(F("Target = "));
+                    Serial.println(_timer._targetTime);
+                }
             } else {
                 Serial.print(F("Error - Invalid Command ~ `"));
                 Serial.print(str);
@@ -187,50 +300,60 @@ void loop() {
             }
         }
     }
+}
 
-    // Handle Reset button
-    bool btnState = readResetBtnState();
-    if (!btnState && _prevBtnState) {
-        _resetTime = currentTime;
-    } else if (btnState && !_prevBtnState) {
-        if ((currentTime - _resetTime) >= RESET_BTN_TIME_THRESHOLD) {
-            Serial.println(F("Reset Button Held"));
-            _flag_reset = true;
+static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parameters) {
+    Serial.println(F("--\tACCEPT RPC HOOK"));
+
+    bool status = (0 == strcmp(rpc->type, "timer"));
+
+    if (status) {
+        if (parameters.containsKey("duration")) {
+            _timer.timestamp = _timeClient.getFormattedDate();
+            _timer.hours = parameters["duration"];
+            _timer._targetTime = 60 * 60 * _timer.hours + _timeClient.getEpochTime();
+            _timer.active = true;
+
+            POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
+            POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
+            Serial.println("Started Timer RPC");
+
+        } else {
+            Serial.println("Failed to parse timer RPC");
+            status = false;
         }
-        // Otherwise button press was debounced.
-    }
-    _prevBtnState = btnState;
-
-     // Reset State Machine
-    if (_flag_reset) {
-        _flag_reset = false;
-        Serial.println(F("Erasing Config, restarting"));
-        _wifiManager.resetSettings();
-        ESP.restart();
     }
 
-    // Update physical state
-    setSwitchState(_currentState);
-    delay(1);
+    return status;
 }
 
-//==============================================================================
-//  Private Function Implementation
-//==============================================================================
+static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc) {
+    Serial.println(F("--\tCANCEL RPC HOOK"));
 
-static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
-    JsonObject stateObj = doc.createNestedObject("state");
-    stateObj["power"] = _currentState;
+    if (0 == strcmp(rpc->type, "timer")) {
+        _timer.active = false;
+    }
+
+    return true;
 }
 
-static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
-    JsonObject stateObj = doc["state"];
-    _currentState = stateObj["power"];
+static void _pushRPCSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc) {
+    Serial.println(F("--\tPUSH RPC HOOK"));
+
+    JsonObject rpcObj = doc["rpc"];
+    rpcObj["result"] = nullptr;         // Already set by default but for illustration
 }
 
-static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source) {
-    Serial.print(F("Error Handler ~ polip server error during OP="));
-    Serial.print((int)source);
-    Serial.print(F(" with CODE="));
-    Serial.println((int)_polipWorkflow.flags.error);
-} 
+static void _freeRPC(polip_device_t* dev, polip_rpc_t* rpc) {
+    Serial.println(F("--\tFREE RPC HOOK"));
+
+    _timer.active = false; 
+}
+
+static void _notificationSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc) {
+    Serial.println(F("--\tNOTIFICATION SETUP HOOK"));
+
+    doc["message"] = "RPC status updated";
+    doc["code"] = 0; // Notification
+    doc["userVisible"] = false; // Messages should not be directly read by humans
+}
