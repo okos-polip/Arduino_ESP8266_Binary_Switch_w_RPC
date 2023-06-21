@@ -45,7 +45,8 @@
 //  Preprocessor Constants
 //==============================================================================
 
-#define SWITCH_PIN                      (LED_BUILTIN)
+#define STATUS_LED_PIN                  (LED_BUILTIN)
+#define SWITCH_PIN                      (D1)
 #define RESET_BTN_PIN                   (D0)
 
 #define RESET_BTN_TIME_THRESHOLD        (200L)
@@ -61,7 +62,8 @@
 //==============================================================================
 
 #define readResetBtnState() ((bool)digitalRead(RESET_BTN_PIN))
-#define setSwitchState(state) (digitalWrite(SWITCH_PIN, !(bool)(state))) //Active LOW
+#define setSwitchState(state) (digitalWrite(SWITCH_PIN, (bool)(state))) //Active LOW
+#define writeStatusLED(state) (digitalWrite(STATUS_LED_PIN, !(bool)(state)))
 
 //==============================================================================
 //  Data Structure Declaration
@@ -96,9 +98,11 @@ static polip_workflow_t _polipWorkflow;
 static polip_rpc_workflow_t _polipRPCWorkflow;
 
 static unsigned long _resetTime;
+static unsigned long _blinkTime;
 static bool _flag_reset = false;
 static bool _prevBtnState = false;
 static bool _currentState = false;
+static bool _blinkState = false;
 static soft_timer_t _timer;
 
 //==============================================================================
@@ -123,9 +127,11 @@ void setup() {
     Serial.begin(DEBUG_SERIAL_BAUD);
     Serial.flush();
 
+    pinMode(STATUS_LED_PIN, OUTPUT);
     pinMode(SWITCH_PIN, OUTPUT);
     pinMode(RESET_BTN_PIN, INPUT);
     setSwitchState(_currentState);
+    writeStatusLED(_blinkState);
 
     _wifiManager.autoConnect(FALLBACK_AP_NAME);
 
@@ -204,6 +210,14 @@ void loop() {
         ESP.restart();
     }
 
+    // Blink the LED at a certain rate dependent on state of purifier
+    //  Useful for debugging
+    if ((currentTime - _blinkTime) > _blinkDurationByState()) {
+        _blinkTime = currentTime;
+        writeStatusLED(_blinkState);
+        _blinkState = !_blinkState;
+    }
+
     // Update physical state
     setSwitchState(_currentState);
     delay(1);
@@ -214,7 +228,6 @@ void loop() {
 //==============================================================================
 
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
-    Serial.println(F("--\tPUSH STATE SETUP HOOK"));
 
     JsonObject stateObj = doc.createNestedObject("state");
     stateObj["power"] = _currentState;
@@ -229,7 +242,6 @@ static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
 }
 
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
-    Serial.println(F("--\tPOLL STATE RESPONSE HOOK"));
 
     JsonObject stateObj = doc["state"];
     _currentState = stateObj["power"];
@@ -303,7 +315,6 @@ static void _debugSerialInterface(void) {
 }
 
 static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parameters) {
-    Serial.println(F("--\tACCEPT RPC HOOK"));
 
     bool status = (0 == strcmp(rpc->type, "timer"));
 
@@ -328,7 +339,6 @@ static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parame
 }
 
 static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc) {
-    Serial.println(F("--\tCANCEL RPC HOOK"));
 
     if (0 == strcmp(rpc->type, "timer")) {
         _timer.active = false;
@@ -338,22 +348,26 @@ static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc) {
 }
 
 static void _pushRPCSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc) {
-    Serial.println(F("--\tPUSH RPC HOOK"));
-
     JsonObject rpcObj = doc["rpc"];
     rpcObj["result"] = nullptr;         // Already set by default but for illustration
 }
 
 static void _freeRPC(polip_device_t* dev, polip_rpc_t* rpc) {
-    Serial.println(F("--\tFREE RPC HOOK"));
-
     _timer.active = false; 
 }
 
 static void _notificationSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc) {
-    Serial.println(F("--\tNOTIFICATION SETUP HOOK"));
-
     doc["message"] = "RPC status updated";
     doc["code"] = 0; // Notification
     doc["userVisible"] = false; // Messages should not be directly read by humans
+}
+
+static unsigned long _blinkDurationByState(void) {
+    if (POLIP_WORKFLOW_IN_ERROR(&_polipWorkflow)) {
+        return 1L;
+    } else if (_currentState) {
+        return 500L;
+    } else {
+        return 1000L;
+    }
 }
