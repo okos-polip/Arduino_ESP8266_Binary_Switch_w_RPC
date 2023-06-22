@@ -72,8 +72,9 @@
 typedef struct _soft_timer {
     bool active = false;
     String timestamp;
-    int hours;
+    float hours;
     unsigned long _targetTime; // use getEpochTime()
+    polip_rpc_t* rpcPtr;
 } soft_timer_t;
 
 //==============================================================================
@@ -111,7 +112,7 @@ static soft_timer_t _timer;
 
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc);
-static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source);
+static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source, polip_ret_code_t error);
 static void _debugSerialInterface(void);
 static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parameters);
 static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc);
@@ -177,10 +178,14 @@ void loop() {
 
     // Monitor soft timer
     if (_timer.active && _timeClient.getEpochTime() >= _timer._targetTime) {
+        Serial.println("Soft Timer Completed");
         _timer.active = false;
         _currentState = false;
-        POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow);
+        POLIP_RPC_WORKFLOW_RPC_SUCCEEDED(&_polipRPCWorkflow, _timer.rpcPtr);
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+        
+    } else if (_timer.active) {
+        Serial.println("Soft Timer Active");
     }
 
     // Update Polip Server
@@ -249,11 +254,11 @@ static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
     // Note ignore timer (must be set via RPC)
 }
 
-static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source) {
+static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source, polip_ret_code_t error) {
     Serial.print(F("Error Handler ~ polip server error during OP="));
     Serial.print((int)source);
     Serial.print(F(" with CODE="));
-    Serial.println((int)_polipWorkflow.flags.error);
+    Serial.println((int)error);
 } 
 
 static void _debugSerialInterface(void) {
@@ -324,8 +329,8 @@ static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parame
             _timer.hours = parameters["duration"];
             _timer._targetTime = 60 * 60 * _timer.hours + _timeClient.getEpochTime();
             _timer.active = true;
+            _timer.rpcPtr = rpc;
 
-            POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
             POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
             Serial.println("Started Timer RPC");
 
