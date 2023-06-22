@@ -183,9 +183,6 @@ void loop() {
         _currentState = false;
         POLIP_RPC_WORKFLOW_RPC_SUCCEEDED(&_polipRPCWorkflow, _timer.rpcPtr);
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-        
-    } else if (_timer.active) {
-        Serial.println("Soft Timer Active");
     }
 
     // Update Polip Server
@@ -347,6 +344,7 @@ static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc) {
 
     if (0 == strcmp(rpc->type, "timer")) {
         _timer.active = false;
+        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
     }
 
     return true;
