@@ -106,6 +106,8 @@ static bool _currentState = false;
 static bool _blinkState = false;
 static soft_timer_t _timer;
 
+static char _transmissionBuffer[POLIP_MIN_ARBITRARY_MSG_BUFFER_SIZE];
+
 //==============================================================================
 //  Private Function Prototypes
 //==============================================================================
@@ -146,6 +148,8 @@ void setup() {
     _polipDevice.hardwareStr = HARDWARE_STR;
     _polipDevice.firmwareStr = FIRMWARE_STR;
     _polipDevice.skipTagCheck = false;
+    _polipDevice.buffer = _transmissionBuffer;
+    _polipDevice.bufferLen = sizeof(_transmissionBuffer);
 
     _polipRPCWorkflow.params.pushAdditionalNotification = true;
     _polipRPCWorkflow.hooks.acceptRPC = _acceptRPC;
